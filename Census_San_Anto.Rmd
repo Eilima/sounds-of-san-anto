@@ -1,0 +1,192 @@
+---
+title: "Sounds of San Anto: Neighborhood Context & Music Venues"
+author: "Erick"
+date: "`r Sys.Date()`"
+output: html_notebook
+---
+
+# Setup
+```{r setup}
+library(tidyverse)
+library(readxl)
+```
+
+---
+
+# 1. Load Sounds of San Anto Data
+```{r load-sananto}
+venues <- read_excel("san_anto_1.xlsx", sheet = "venues_with_coordinates")
+events <- read_excel("san_anto_1.xlsx", sheet = "Ven_Ev_Ar_Address")
+```
+
+---
+
+# 2. Load NHGIS Census Data
+```{r load-nhgis}
+rent_1980 <- read_csv("nhgis0001_csv/nhgis0001_ds107_1980_tract.csv")
+rent_1990 <- read_csv("nhgis0001_csv/nhgis0001_ds123_1990_tract.csv")
+rent_2000 <- read_csv("nhgis0001_csv/nhgis0001_ds151_2000_tract.csv")
+income_ts <- read_csv("nhgis0001_csv/nhgis0001_ts_nominal_tract.csv")
+```
+
+---
+
+# 3. Filter to Bexar County
+```{r filter-bexar}
+# Bexar County FIPS = 029, Texas FIPS = 48
+# GISJOIN format: G + state_fips + 0 + county_fips + 0 + tract
+
+bexar_rent_1980 <- rent_1980 %>% filter(COUNTY == "Bexar")
+bexar_rent_1990 <- rent_1990 %>% filter(COUNTY == "Bexar")
+bexar_rent_2000 <- rent_2000 %>% filter(COUNTY == "Bexar")
+bexar_income    <- income_ts  %>% filter(COUNTY == "Bexar County")
+```
+
+---
+
+# 4. Stack Rent Data
+```{r stack-rent}
+# Column names from codebooks:
+# 1980: DFK001, 1990: EYU001, 2000: GBO001
+
+rent_combined <- bind_rows(
+  bexar_rent_1980 %>% transmute(GISJOIN, year = 1980, median_rent = DFK001),
+  bexar_rent_1990 %>% transmute(GISJOIN, year = 1990, median_rent = EYU001),
+  bexar_rent_2000 %>% transmute(GISJOIN, year = 2000, median_rent = GBO001)
+)
+```
+
+---
+
+# 5. Prep Income Data
+```{r prep-income}
+# Column names from codebook: B79AA1980, B79AA1990, B79AA2000
+# Pivot to long format to match rent structure
+
+income_long <- bexar_income %>%
+  select(GJOIN1980, GJOIN1990, GJOIN2000, COUNTY, TRACTA,
+         B79AA1980, B79AA1990, B79AA2000) %>%
+  pivot_longer(
+    cols = starts_with("B79AA"),
+    names_to = "year",
+    values_to = "median_income"
+  ) %>%
+  mutate(year = as.integer(str_extract(year, "\\d{4}")))
+```
+
+---
+
+# 6. Join Rent and Income
+```{r join}
+# Income uses separate GJOIN columns per year — need to match correctly
+income_with_gisjoin <- income_long %>%
+  mutate(GISJOIN = case_when(
+    year == 1980 ~ GJOIN1980,
+    year == 1990 ~ GJOIN1990,
+    year == 2000 ~ GJOIN2000
+  ))
+
+tract_data <- rent_combined %>%
+  left_join(
+    income_with_gisjoin %>% select(GISJOIN, year, median_income),
+    by = c("GISJOIN", "year")
+  )
+
+# Check
+glimpse(tract_data)
+```
+
+---
+
+# 7. Count Venues per Tract
+```{r venue-counts}
+# venues_with_coordinates has GISJOIN? No — it has ZIP only.
+# We'll aggregate by ZIP for now until shapefile spatial join is available.
+
+# Summarize events by venue and year decade
+events_decade <- events %>%
+  mutate(
+    decade = floor(as.numeric(Year) / 10) * 10
+  ) %>%
+  filter(decade %in% c(1980, 1990, 2000)) %>%
+  count(Venue, decade)
+glimpse(events_decade)
+```
+
+---
+
+# 8. Exploratory: Rent Trends in Bexar County Tracts
+```{r rent-trends}
+tract_data %>%
+  filter(!is.na(median_rent)) %>%
+  ggplot(aes(x = factor(year), y = median_rent)) +
+  geom_boxplot(fill = "steelblue", alpha = 0.7) +
+  labs(
+    title = "Median Gross Rent by Decade — Bexar County Census Tracts",
+    x = "Year",
+    y = "Median Gross Rent ($)"
+  ) +
+  theme_minimal()
+```
+
+---
+
+# 9. Exploratory: Income Trends
+```{r income-trends}
+tract_data %>%
+  filter(!is.na(median_income)) %>%
+  ggplot(aes(x = factor(year), y = median_income)) +
+  geom_boxplot(fill = "coral", alpha = 0.7) +
+  labs(
+    title = "Median Household Income by Decade — Bexar County Census Tracts",
+    x = "Year",
+    y = "Median Household Income ($)"
+  ) +
+  theme_minimal()
+```
+
+# 10. Venue Activity vs. Rent Over Time
+```{r venue-rent}
+# Step 1: Summarize event counts per venue per decade
+venue_decade_counts <- events %>%
+  mutate(decade = floor(as.numeric(Year) / 10) * 10) %>%
+  filter(decade %in% c(1980, 1990, 2000)) %>%
+  count(Venue, decade)
+
+# Step 2: Get one ZIP per venue from venues sheet
+venue_zip <- venues %>%
+  select(Venue_Name, Zip) %>%
+  mutate(Zip = as.character(Zip)) %>%
+  distinct()
+
+# Step 3: Get one rent value per ZIP per decade
+# Using ZIP from venues and matching to tract-level rent via GISJOIN
+# For now: average rent across tracts in Bexar per decade as a proxy
+# (until spatial join with shapefile is done)
+rent_summary <- tract_data %>%
+  filter(!is.na(median_rent)) %>%
+  group_by(year) %>%
+  summarise(avg_rent = mean(median_rent, na.rm = TRUE))
+
+# Step 4: Join venue counts to rent summary by decade
+venue_decade_counts <- events %>%
+  mutate(decade = floor(as.numeric(Year) / 10) * 10) %>%
+  filter(decade %in% c(1980, 1990, 2000)) %>%
+  count(Venue, decade)
+
+# Step 5: Plot — event count vs. avg rent by decade
+glimpse(tract_data)
+venue_rent %>%
+  group_by(decade, avg_rent) %>%
+  summarise(total_events = sum(n), .groups = "drop") %>%
+  ggplot(aes(x = avg_rent, y = total_events, label = decade)) +
+  geom_point(size = 4, color = "steelblue") +
+  geom_text(vjust = -1) +
+  labs(
+    title = "Total Concert Events vs. Average Rent — Bexar County",
+    subtitle = "Each point represents a decade",
+    x = "Average Median Gross Rent ($)",
+    y = "Total Concert Events"
+  ) +
+  theme_minimal()
+```

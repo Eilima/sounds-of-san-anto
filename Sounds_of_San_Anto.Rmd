@@ -1,0 +1,228 @@
+---
+title: "Sounds of San Anto"
+author: "Erick Lima"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+
+## Packages Used
+```{r setup, message=FALSE, warning=FALSE, echo=FALSE}
+library(tidyverse)
+library(dplyr)
+library(tidygeocoder)
+library(ggplot2)
+library(readxl)
+library(leaflet)
+library(tidycensus)
+```
+# Introduction
+
+This notebook presents a surface-level exploratory analysis of the dataset. The goal is to identify patterns and potential connections between concert activity, venue geography, genre trends, and demographic factors such as race and income — laying the groundwork for deeper analysis.
+
+## Load Data
+The following loads data from the source Excel file and saves it to the dataframe *my_data*.
+```{r}
+my_data <- read_excel("san_anto_1.xlsx")
+head(my_data)
+```
+
+## Show Concerts per Year
+We first diplay the number of concerts occuring per year in San Antonio.
+```{r}
+## Filtering
+events_per_year <- my_data %>%
+  count(Year) %>%
+  arrange(Year)
+## Plotting
+ggplot(events_per_year, aes(x = as.numeric(Year), y = n)) +
+  geom_line() +
+  labs(title = "Concerts Per Year in San Antonio",
+       x = "Year", y = "Number of Events") +
+  scale_x_continuous(breaks = seq(1950, 2020, by = 5))
+```
+
+We are able to see that from this data set that the number of concerts grew tremendously during the 1980s and that between the 1990 and 1995 the number of concerts decreased and not bouncing back until 1997. More analysis would have to be done to determine if this is due to an economic, political etc. or if this is just due to an incomplete data set. 
+
+## Busiest Months for Concerts
+Here we find the number of concerts that occur per month through out all the years of the data set.
+```{r}
+# Filtering
+events_per_month_year <- my_data %>%
+  count(Year, Month) %>%
+  mutate(Month = factor(Month, levels = month.name))
+# Plotting
+#ggplot(events_per_month_year, aes(x = as.numeric(Year), y = Month, fill = n)) +
+#  geom_tile() +
+#  scale_fill_viridis_c() +
+#  labs(title = "Concerts by Month and Year",
+#       x = "Year", y = "Month", fill = "Events")
+
+ggplot(events_per_month_year, aes(x = Month, y = n)) + 
+  geom_col(fill = "steelblue") + 
+  labs(
+    x = "Month",
+    y = "# of Concerts",
+    title = "Aggregate # of Concerts by Month"
+  ) + 
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+```
+
+As we can see above, the cluster of months in where the concerts are the most popular are during summer months and begins to trend downwards as fall begins, with an outlier here being February. We would have to dive in to the data set why this outlier exist, it may be due to a certain festival or event being held in February.
+
+## Events Per Decade
+Here we look at the number of events that take place per decade.
+```{r}
+# Filtering
+events_per_decade <- my_data %>%
+  mutate(year_num = as.numeric(Year),
+    decade = (year_num %/% 10) * 10) %>%
+  group_by(decade) %>%
+  summarise(events = n())
+# Plotting
+ggplot(events_per_decade, aes(x = factor(decade), y = events)) +
+  geom_col(fill = "steelblue") +
+  labs(
+    title = "Events per Decade",
+    x = "Decade",
+    y = "Number of Events"
+  ) +
+  theme_minimal()
+```
+
+As we can see from the above bar chart, we find that the decade with the highest number of concerts was the 1980s, nearly hitting the 7000 mark. We see a significant downward trend in the 2010s but the likely reason for that may be due to an incomplete data set. 
+## Most Active Venues
+Below we will plot the top 20 most popular venues in descending order. 
+```{r}
+#Filtering
+events_per_venues <- my_data %>% count(Venue)
+events_per_venues <- events_per_venues %>% arrange(desc(n))
+top_20_venues <- events_per_venues %>% head(n=20, events_per_venues)
+#Plotting
+ggplot(top_20_venues, aes(reorder(Venue, -n), n)) + geom_col(fill = "steelblue") + labs(
+  title = "Top 20 Venues of All Time",
+  x = "Venue",
+  y = "Count"
+  ) + theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+    
+    )
+```
+
+This plot is able to give us the names of the top 20 venues in where performances were held. In the future we could dive in deeper by plotting the locations of these top venues and comparing the income in the local area compared to the least popular venues and their general economic and racial makeup.
+
+## Venue Map
+*Note: Jacks Bar in the spreadsheet has positive longitudinal coordinates when they are meant to be negative.*
+We plot a map of venuew in where we have their coordinates. Note: The dataset doesn't have the coordinates for most of the venues. 
+
+```{r}
+# Filtering
+venue_map <- my_data %>% select(Venue, Longitude, Latitude) %>% distinct()
+# Plotting
+satx_m <- leaflet(venue_map) %>%
+  addTiles() %>%
+  addMarkers(lng = ~Longitude, lat = ~Latitude, popup = ~Venue)
+satx_m  
+```
+
+As we can see from the plot, most of the venues are located on the north side of San Antonio with only a handful being located on the south side of TX-151. We hope in the future to determine a reason for this and possible compare lost economic impact on communities and neighborhoods on the southside. 
+## Most Frequent Artists
+Below we plot the artists/groups that have had the highest number of concerts in San Antonio. 
+```{r}
+# Filtering
+most_freq_artists <- my_data %>% select(Artist) %>% count(Artist)
+most_freq_artists <- most_freq_artists %>% arrange(desc(n))
+top_20_freq_artist <- most_freq_artists %>% head(n = 20, most_freq_artists)
+# Plotting
+ggplot(top_20_freq_artist, aes(reorder(Artist, -n), n)) + geom_col(fill = "steelblue") + labs(
+  title = "Top 20 Artists of All Time",
+  x = "Artist",
+  y = "Count"
+  ) + theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+    
+    )
+```
+
+We can see from this plot that the San Antonio Symphony Orchestra is the most frequently performing act in the dataset, followed by country artists such as Johnny Bush and Willie Nelson. Notably, Tish Hinojosa is the only Latino artist represented in the top 20, which may reflect the collector bias discussed earlier. Future analysis could include adding the primary genre of each artist to this chart, as well as breaking down the most popular artists by decade.
+
+*Note: The Smith Brothers name needs to be edited in the data set*
+
+## Most Common Genres
+Import artistsGenre worksheet from excel file.
+```{r}
+artistsGenre <- read_excel("san_anto_1.xlsx", sheet = "artistsGenre")
+```
+Keep only the first instance of artist genre from the excel table and join main df with new artistsGenre df via left join. 
+```{r}
+artist_genres_clean <- artistsGenre %>% distinct(Name, .keep_all = TRUE)
+Artist_Genres_df <- my_data %>% left_join(artist_genres_clean, by = c("Artist" = "Name"))
+```
+Find & plot the top 20 most popular genres
+```{r}
+top_genres_all_time <- Artist_Genres_df %>% 
+  select(Genres) %>% 
+  filter(!is.na(Genres), !Genres %in% c("Unknown")) %>%
+  count(Genres) %>% arrange(desc(n))
+top_20_genres_all_time <- head(n=20, top_genres_all_time)
+ggplot(top_20_genres_all_time, aes(reorder(Genres, -n), n)) + geom_col(
+  fill = "steelblue") + 
+  labs(
+    title = "Top 20 Genres of All Time",
+    x = "Genre",
+    y = "Count"
+  ) + theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+    
+    )
+```
+
+From the above plot we continue to see the bias the original data set author had for Country music. We see that Country dominates but if you combine all country subgenres (Country, Classic Texas Country, Country Road, Outlaw Country, Heartland Rock, Contemporary Country, Nashville Sound) the gap over Tejano is even larger, which is worth noting. Tejano at #2 is still significant given how undercounted it likely is due to the collector bias.
+
+Many of the genres in this dataset are highly specific micro-genres, which fragments the data and makes it harder to see broader trends. Consolidating subgenres (e.g. grouping all country variants, all metal variants) into parent categories would give a cleaner picture of SA's musical identity.
+
+An additional analysis that can be made is finding the most popular genre for each decade.
+
+## Genre Trends Over Time
+We will plot the trends of the most popular genres by decade the below plot.
+```{r}
+# Filtering
+genre_per_decade <- Artist_Genres_df %>%
+  mutate(year_num = as.numeric(Year),
+    decade = (year_num %/% 10) * 10) %>%
+  group_by(decade, Genres) %>% filter(!is.na(Genres), !Genres %in% c("Unknown")) %>%
+  count(Genres) 
+
+top5_genres <- genre_per_decade %>% 
+  group_by(Genres) %>% 
+  summarise(total = sum(n)) %>% 
+  slice_max(total, n=5) %>% 
+  pull(Genres)
+
+genre_per_decade_top5 <- genre_per_decade %>% 
+  filter(Genres %in% top5_genres)
+
+ggplot(genre_per_decade_top5, aes(fill=Genres, y=n, x=decade)) + 
+    geom_col(position="dodge") + labs(
+      title = "Top 5 Genres per Decade",
+      x = "Decade",
+      y = "# of Concerts"
+    )
+    
+
+```
+
+Again, we see the same bias we had previously mentioned. The data set is dominated by country and a separation of artists by micro genres gives us an incomplete picture of the overall popular genres in the San Antonio's history. In future analysis I hope to address these issue to see a better and clearer picture of San Antonio's musical history. 
+
+# Findings
+This notebook represents an initial exploratory analysis of the Sounds of San Anto dataset. While the data spans over a century of San Antonio concert history, several limitations became apparent throughout this analysis. The dataset reflects a clear collector bias toward country music, and the use of highly specific micro-genres fragments the data in ways that make broader trends difficult to interpret. Additionally, a significant portion of events lack genre information entirely, limiting the scope of any genre-based conclusions.
+Despite these limitations, the data reveals meaningful patternsm, including the geographic concentration of venues on the north side of San Antonio and the consistent presence of Tejano music across multiple decades, even within an undercounted dataset.
+
+Future work will focus on cleaning and consolidating genre classifications, geocoding remaining venues, and integrating U.S. Census data to explore the relationship between concert activity and the demographic and economic makeup of San Antonio's neighborhoods.
+
+```{r, echo=FALSE}
+# census_api_key("622884d54e7cd629a0985688a346aedfa9ce80d3", install = TRUE)
+```
+
