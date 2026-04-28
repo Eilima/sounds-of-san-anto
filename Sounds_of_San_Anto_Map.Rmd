@@ -1,0 +1,1048 @@
+---
+title: "Sounds of San Anto: Music Venues & Neighborhood Change, 1970–2010"
+author: "Erick Lima | CEDISH / UTSA"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    self_contained: true
+    code_folding: hide
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+knitr::opts_knit$set(root.dir = "/Users/erick/CEDISH/San_Anto")
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, echo = TRUE)
+
+library(tidyverse)
+library(readxl)
+library(sf)
+library(tigris)
+library(leaflet)
+library(leaflet.extras)
+library(htmlwidgets)
+library(htmltools)
+library(RColorBrewer)
+library(tidycensus)
+
+options(tigris_use_cache = TRUE)
+```
+
+---
+
+# Introduction
+
+This notebook builds a layered interactive HTML map telling a gentrification
+story: how concert venue geography in San Antonio correlates with neighborhood
+income and rent changes from 1980–2000, with race, housing tenure, population
+shift, venue churn, event volume collapse, and genre displacement as additional
+analytical layers. The map integrates 312 geocoded music venues (1970–2010),
+NHGIS census data, and tidycensus decennial estimates for Bexar County.
+
+---
+
+# Step 1 — Load and Clean Events
+
+```{r load-events}
+events_raw <- read_excel("san_anto_1.xlsx", sheet = "Ven_Ev_Ar_Address")
+
+events <- events_raw %>%
+  filter(!is.na(Latitude), !is.na(Longitude)) %>%
+  mutate(Longitude = ifelse(Longitude > 0, -Longitude, Longitude)) %>%
+  mutate(
+    Year   = as.integer(Year),
+    decade = floor(Year / 10) * 10
+  )
+
+cat("Geocoded events retained:", nrow(events), "of", nrow(events_raw), "\n")
+```
+
+```{r load-genres}
+artists_genre <- read_excel("san_anto_1.xlsx", sheet = "artistsGenre") %>%
+  distinct(Name, .keep_all = TRUE)
+
+macro_genre_crosswalk <- function(genre) {
+  case_when(
+    str_detect(genre, regex(
+      "country|outlaw|heartland|western swing|honky|bluegrass|rockabilly|
+       nashville|americana|texas country|classic country|cowboy|cowpunk",
+      ignore_case = TRUE, comments = TRUE)) ~ "Country",
+
+    str_detect(genre, regex(
+      "tejano|conjunto|norteño|latin|salsa|cumbia|mariachi|ranchera|banda|
+       chicano|mexican|hispanico|tropical|bolero|corrido",
+      ignore_case = TRUE, comments = TRUE)) ~ "Tejano/Latin",
+
+    str_detect(genre, regex(
+      "classical|symphony|orchestra|opera|chamber|choral|baroque|
+       contemporary classical|avant.garde classical",
+      ignore_case = TRUE, comments = TRUE)) ~ "Classical",
+
+    str_detect(genre, regex(
+      "rock|punk|grunge|alternative|indie|garage|psychedelic|progressive rock|
+       hard rock|post.punk|new wave|surf rock",
+      ignore_case = TRUE, comments = TRUE)) ~ "Rock",
+
+    str_detect(genre, regex(
+      "jazz|bebop|swing|fusion|big band|smooth jazz|cool jazz|free jazz",
+      ignore_case = TRUE, comments = TRUE)) ~ "Jazz",
+
+    str_detect(genre, regex(
+      "blues|r&b|rhythm|soul|funk|gospel|motown|doo.wop",
+      ignore_case = TRUE, comments = TRUE)) ~ "Blues/R&B",
+
+    str_detect(genre, regex(
+      "metal|heavy metal|thrash|doom|death metal|black metal|glam metal",
+      ignore_case = TRUE, comments = TRUE)) ~ "Metal",
+
+    str_detect(genre, regex(
+      "pop|adult contemporary|top 40|dance.pop|bubblegum",
+      ignore_case = TRUE, comments = TRUE)) ~ "Pop",
+
+    str_detect(genre, regex(
+      "electronic|techno|house|edm|synth|ambient|trance|drum.and.bass|
+       industrial|electronica",
+      ignore_case = TRUE, comments = TRUE)) ~ "Electronic",
+
+    is.na(genre) ~ "Unknown/Other",
+    TRUE          ~ "Other"
+  )
+}
+
+artists_genre <- artists_genre %>%
+  mutate(macro_genre = macro_genre_crosswalk(Genres))
+
+events <- events %>%
+  left_join(artists_genre %>% select(Name, Genres, macro_genre),
+            by = c("Artist" = "Name")) %>%
+  mutate(macro_genre = replace_na(macro_genre, "Unknown/Other"))
+
+cat("Events missing genre data:", sum(events$macro_genre == "Unknown/Other"), "\n")
+```
+
+```{r events-sf}
+events_sf <- events %>%
+  filter(!is.na(Longitude), !is.na(Latitude)) %>%
+  st_as_sf(coords = c("Longitude", "Latitude"), crs = 4326)
+```
+
+---
+
+# Step 2 — Census Tract Geometries
+
+```{r load-tracts}
+tracts_bexar <- tracts(state = "TX", county = "Bexar", year = 2000, cb = TRUE) %>%
+  st_transform(crs = 4326) %>%
+  mutate(GEOID = paste0(STATE, COUNTY, TRACT))
+
+cat("Bexar County tracts loaded:", nrow(tracts_bexar), "\n")
+```
+
+---
+
+# Step 3 — NHGIS Economic Data
+
+NHGIS GISJOIN formats differ by year (1980/1990 = 13-char, 2000 = 15-char).
+We convert all to the standard 11-char GEOID used by tigris.
+
+```{r load-nhgis}
+rent_1980 <- read_csv("nhgis0001_csv/nhgis0001_ds107_1980_tract.csv") %>%
+  filter(COUNTY == "Bexar") %>%
+  transmute(GISJOIN, rent_1980 = DFK001)
+
+rent_1990 <- read_csv("nhgis0001_csv/nhgis0001_ds123_1990_tract.csv") %>%
+  filter(COUNTY == "Bexar") %>%
+  transmute(GISJOIN, rent_1990 = EYU001)
+
+rent_2000 <- read_csv("nhgis0001_csv/nhgis0001_ds151_2000_tract.csv") %>%
+  filter(COUNTY == "Bexar") %>%
+  transmute(GISJOIN, rent_2000 = GBO001)
+
+income_ts <- read_csv("nhgis0001_csv/nhgis0001_ts_nominal_tract.csv") %>%
+  filter(COUNTY == "Bexar County") %>%
+  select(GJOIN1980, GJOIN1990, GJOIN2000, B79AA1980, B79AA1990, B79AA2000)
+```
+
+```{r gisjoin-helpers}
+gisjoin_to_geoid <- function(gisjoin, tract_digits) {
+  state_part  <- substr(gisjoin, 2, 3)
+  county_part <- substr(gisjoin, 5, 7)
+  tract_raw   <- substr(gisjoin, 9, 8 + tract_digits)
+  tract_part  <- str_pad(tract_raw, 6, side = "right", pad = "0")
+  paste0(state_part, county_part, tract_part)
+}
+
+rent_1980 <- rent_1980 %>% mutate(GEOID = gisjoin_to_geoid(GISJOIN, 4))
+rent_1990 <- rent_1990 %>% mutate(GEOID = gisjoin_to_geoid(GISJOIN, 4))
+rent_2000 <- rent_2000 %>% mutate(GEOID = gisjoin_to_geoid(GISJOIN, 6))
+
+income_wide <- income_ts %>%
+  mutate(GEOID = gisjoin_to_geoid(GJOIN2000, 6)) %>%
+  rename(income_1980 = B79AA1980, income_1990 = B79AA1990, income_2000 = B79AA2000)
+```
+
+```{r join-tract-data}
+dedup_geoid <- function(df, val_col) {
+  df %>%
+    group_by(GEOID) %>%
+    summarise(across(all_of(val_col), ~ first(na.omit(.x))), .groups = "drop")
+}
+
+econ_data <- dedup_geoid(rent_1980, "rent_1980") %>%
+  full_join(dedup_geoid(rent_1990, "rent_1990"), by = "GEOID") %>%
+  full_join(dedup_geoid(rent_2000, "rent_2000"), by = "GEOID") %>%
+  full_join(
+    income_wide %>%
+      group_by(GEOID) %>%
+      summarise(across(c(income_1980, income_1990, income_2000),
+                       ~ first(na.omit(.x))), .groups = "drop"),
+    by = "GEOID"
+  ) %>%
+  mutate(rent_change_80_00 = rent_2000 - rent_1980)
+
+tracts_econ <- tracts_bexar %>%
+  left_join(econ_data, by = "GEOID")
+
+cat("Tracts with rent_1980:", sum(!is.na(tracts_econ$rent_1980)), "\n")
+cat("Tracts with rent_2000:", sum(!is.na(tracts_econ$rent_2000)), "\n")
+```
+
+---
+
+# Step 4 — Race, Ethnicity, Housing Tenure & Displacement Risk
+
+We extend the tidycensus pull to capture Hispanic %, Black %, and
+renter-occupied %. Black population gives a fuller picture of the racialized
+geography of displacement (especially the eastside); housing tenure flags
+which tracts are most vulnerable (high renter share = more exposure to rent
+increases). We then build a **Displacement Risk Index** (0–100) by combining
+rent change 1980–2000 and renter-occupied % — both min-max normalized and
+averaged. This composite captures both the economic pressure and the
+residential vulnerability in each tract without requiring unavailable
+historical population data.
+
+```{r census-2000-extended}
+# ── Single 2000 SF1 pull: race + housing tenure ───────────────────────────────
+# P004001 = Total pop  |  P004002 = Hispanic/Latino  |  P003003 = Black alone
+# H004001 = Total occupied units  |  H004002 = Owner-occ  |  H004003 = Renter-occ
+census_2000 <- get_decennial(
+  geography = "tract",
+  state     = "TX",
+  county    = "Bexar",
+  year      = 2000,
+  variables = c(
+    total_pop   = "P004001",
+    hisp_pop    = "P004002",
+    black_pop   = "P003003",
+    owner_occ   = "H004002",
+    renter_occ  = "H004003"
+  ),
+  output = "wide"
+) %>%
+  mutate(
+    pct_hispanic = ifelse(total_pop > 0,
+                          round(hisp_pop   / total_pop * 100, 1), NA_real_),
+    pct_black    = ifelse(total_pop > 0,
+                          round(black_pop  / total_pop * 100, 1), NA_real_),
+    pct_renter   = ifelse((owner_occ + renter_occ) > 0,
+                          round(renter_occ / (owner_occ + renter_occ) * 100, 1),
+                          NA_real_)
+  ) %>%
+  select(GEOID, total_pop, hisp_pop, pct_hispanic,
+         black_pop, pct_black, owner_occ, renter_occ, pct_renter)
+```
+
+```{r displacement-risk}
+# ── Displacement Risk Index ───────────────────────────────────────────────────
+# tidycensus get_decennial() only supports 2000/2010/2020, so 1990 population
+# is unavailable. Instead we build a composite Displacement Risk Index (0–100)
+# from two variables already in hand:
+#   - Rent pressure:  rent_change_80_00 (economic stress on the tract)
+#   - Renter exposure: pct_renter       (share of households vulnerable to it)
+# Each variable is min-max normalized to [0,1], then averaged.
+# High scores = neighborhoods where rent rose fast AND most residents rented
+# = highest displacement risk.
+
+normalize_01 <- function(x) {
+  rng <- range(x, na.rm = TRUE)
+  if (diff(rng) == 0) return(rep(0, length(x)))
+  (x - rng[1]) / diff(rng)
+}
+
+displacement_risk <- census_2000 %>%
+  select(GEOID, pop_2000 = total_pop) %>%
+  left_join(econ_data %>% select(GEOID, rent_change_80_00), by = "GEOID") %>%
+  left_join(census_2000 %>% select(GEOID, pct_renter),      by = "GEOID") %>%
+  mutate(
+    norm_rent_change = normalize_01(replace_na(rent_change_80_00, 0)),
+    norm_renter      = normalize_01(replace_na(pct_renter, 0)),
+    displacement_risk_idx = round((norm_rent_change + norm_renter) / 2 * 100, 1)
+  ) %>%
+  select(GEOID, pop_2000, displacement_risk_idx)
+
+cat("Tracts with displacement risk index:",
+    sum(!is.na(displacement_risk$displacement_risk_idx)), "\n")
+```
+
+```{r build-tracts-full}
+# Join all census data to tract geometries
+tracts_full <- tracts_econ %>%
+  left_join(census_2000 %>% select(GEOID, pct_hispanic, pct_black, pct_renter,
+                                    total_pop, hisp_pop, black_pop),
+            by = "GEOID") %>%
+  left_join(displacement_risk %>% select(GEOID, pop_2000, displacement_risk_idx),
+            by = "GEOID")
+
+cat("Tracts with race data:",    sum(!is.na(tracts_full$pct_hispanic)), "\n")
+cat("Tracts with Black % data:", sum(!is.na(tracts_full$pct_black)),    "\n")
+cat("Tracts with renter data:",  sum(!is.na(tracts_full$pct_renter)),   "\n")
+cat("Tracts with risk index:",   sum(!is.na(tracts_full$displacement_risk_idx)), "\n")
+```
+
+---
+
+# Step 5 — Load Venues and Build Popups
+
+```{r load-venues}
+venues_raw <- read_excel("san_anto_1.xlsx", sheet = "venues_with_coordinates") %>%
+  filter(needs_geo == FALSE) %>%
+  mutate(
+    Longitude = as.numeric(Longitude),
+    Latitude  = as.numeric(Latitude),
+    Zip       = as.character(Zip),
+    Longitude = ifelse(Longitude > 0, -Longitude, Longitude)
+  ) %>%
+  filter(!is.na(Longitude), !is.na(Latitude))
+
+cat("Geocoded venues:", nrow(venues_raw), "\n")
+```
+
+```{r venue-summaries}
+top_genres_for_venue <- function(genres) {
+  tbl <- sort(table(genres[!is.na(genres) & genres != "Unknown/Other"]),
+              decreasing = TRUE)
+  if (length(tbl) == 0) return("Unknown")
+  paste(names(head(tbl, 3)), collapse = ", ")
+}
+
+venue_summary <- events %>%
+  group_by(Venue) %>%
+  summarise(
+    n_events   = n(),
+    min_year   = min(Year, na.rm = TRUE),
+    max_year   = max(Year, na.rm = TRUE),
+    top_genres = top_genres_for_venue(macro_genre),
+    .groups    = "drop"
+  )
+
+venues_enriched <- venues_raw %>%
+  left_join(venue_summary, by = c("Venue_Name" = "Venue")) %>%
+  mutate(
+    n_events   = replace_na(n_events, 0),
+    top_genres = replace_na(top_genres, "Unknown")
+  )
+```
+
+```{r venue-sf}
+venues_sf <- venues_enriched %>%
+  st_as_sf(coords = c("Longitude", "Latitude"), crs = 4326)
+
+venues_sf <- st_join(
+  venues_sf,
+  tracts_full %>% select(GEOID, rent_1980, rent_2000, rent_change_80_00,
+                          income_2000, pct_hispanic, pct_black, pct_renter),
+  join = st_within
+) %>%
+  distinct(Venue_Name, .keep_all = TRUE)
+
+venues_sf <- venues_sf %>%
+  mutate(
+    popup_html = paste0(
+      "<div style='font-family:sans-serif;font-size:13px;max-width:260px'>",
+      "<b style='font-size:14px'>", Venue_Name, "</b><br>",
+      "<span style='color:#555'>", Address, " · ", Zip, "</span>",
+      "<hr style='margin:4px 0'>",
+      "Active: <b>", ifelse(n_events > 0,
+                            paste0(min_year, "–", max_year), "Unknown"),
+      "</b> · Events: <b>", n_events, "</b><br>",
+      "Top genres: <i>", top_genres, "</i>",
+      "<hr style='margin:4px 0'>",
+      "Nbhd rent 2000: <b>",
+        ifelse(!is.na(rent_2000), paste0("$", format(rent_2000, big.mark=",")), "N/A"),
+        "</b> · Rent Δ: <b>",
+        ifelse(!is.na(rent_change_80_00),
+               paste0("$", format(round(rent_change_80_00), big.mark=",")), "N/A"),
+        "</b><br>",
+      "% Hispanic: <b>",
+        ifelse(!is.na(pct_hispanic), paste0(pct_hispanic, "%"), "N/A"),
+        "</b> · % Black: <b>",
+        ifelse(!is.na(pct_black), paste0(pct_black, "%"), "N/A"),
+        "</b><br>",
+      "% Renter-occupied: <b>",
+        ifelse(!is.na(pct_renter), paste0(pct_renter, "%"), "N/A"),
+        "</b>",
+      "</div>"
+    )
+  )
+```
+
+```{r decade-venue-layers}
+decade_activity <- events %>%
+  filter(!is.na(decade)) %>%
+  group_by(Venue, decade) %>%
+  summarise(n_decade = n(), .groups = "drop")
+
+make_decade_layer <- function(dec) {
+  active <- decade_activity %>% filter(decade == dec) %>% pull(Venue)
+  venues_sf %>% filter(Venue_Name %in% active)
+}
+
+venues_1970s <- make_decade_layer(1970)
+venues_1980s <- make_decade_layer(1980)
+venues_1990s <- make_decade_layer(1990)
+venues_2000s <- make_decade_layer(2000)
+
+cat("Venues active — 1970s:", nrow(venues_1970s),
+    "| 1980s:", nrow(venues_1980s),
+    "| 1990s:", nrow(venues_1990s),
+    "| 2000s:", nrow(venues_2000s), "\n")
+```
+
+---
+
+# Step 5b — Venue Churn Analysis
+
+Venue churn reveals the direct cultural cost of gentrification: which
+neighborhoods lost music venues between the 1980s and 2000s even as rents rose?
+We identify venues active in the 1980s but gone by the 2000s (lost), and new
+venues that appeared in the 2000s (gained), then aggregate both by census tract.
+
+```{r venue-churn}
+venues_1980s_names <- decade_activity %>% filter(decade == 1980) %>% pull(Venue)
+venues_2000s_names <- decade_activity %>% filter(decade == 2000) %>% pull(Venue)
+
+lost_names   <- setdiff(venues_1980s_names, venues_2000s_names)
+gained_names <- setdiff(venues_2000s_names, venues_1980s_names)
+
+venues_lost_sf   <- venues_sf %>% filter(Venue_Name %in% lost_names)
+venues_gained_sf <- venues_sf %>% filter(Venue_Name %in% gained_names)
+
+# Popup for churn markers
+venues_lost_sf <- venues_lost_sf %>%
+  mutate(popup_html = paste0(
+    "<div style='font-family:sans-serif;font-size:13px;max-width:240px'>",
+    "<b style='color:#c0392b'>&#x274C; LOST: ", Venue_Name, "</b><br>",
+    "<span style='color:#555'>", Address, "</span><br>",
+    "Active 1980s · not present by 2000s<br>",
+    "Rent change in tract: <b>",
+      ifelse(!is.na(rent_change_80_00),
+             paste0("$", format(round(rent_change_80_00), big.mark=",")), "N/A"),
+    "</b></div>"
+  ))
+
+venues_gained_sf <- venues_gained_sf %>%
+  mutate(popup_html = paste0(
+    "<div style='font-family:sans-serif;font-size:13px;max-width:240px'>",
+    "<b style='color:#27ae60'>&#x2705; NEW: ", Venue_Name, "</b><br>",
+    "<span style='color:#555'>", Address, "</span><br>",
+    "New in 2000s · not present in 1980s<br>",
+    "Rent change in tract: <b>",
+      ifelse(!is.na(rent_change_80_00),
+             paste0("$", format(round(rent_change_80_00), big.mark=",")), "N/A"),
+    "</b></div>"
+  ))
+
+# Tract-level churn counts (join back to tracts_full)
+lost_by_tract <- venues_lost_sf %>%
+  st_drop_geometry() %>%
+  filter(!is.na(GEOID)) %>%
+  count(GEOID, name = "venues_lost")
+
+gained_by_tract <- venues_gained_sf %>%
+  st_drop_geometry() %>%
+  filter(!is.na(GEOID)) %>%
+  count(GEOID, name = "venues_gained")
+
+venue_churn_tract <- lost_by_tract %>%
+  full_join(gained_by_tract, by = "GEOID") %>%
+  mutate(
+    venues_lost   = replace_na(venues_lost,   0),
+    venues_gained = replace_na(venues_gained, 0),
+    net_venue_change = venues_gained - venues_lost
+  )
+
+tracts_full <- tracts_full %>%
+  left_join(venue_churn_tract, by = "GEOID") %>%
+  mutate(
+    venues_lost      = replace_na(venues_lost,      0),
+    venues_gained    = replace_na(venues_gained,    0),
+    net_venue_change = replace_na(net_venue_change, 0)
+  )
+
+cat("Venues lost (1980s → 2000s):", length(lost_names), "\n")
+cat("Venues gained (new in 2000s):", length(gained_names), "\n")
+cat("Tracts that lost at least 1 venue:", sum(tracts_full$venues_lost > 0), "\n")
+```
+
+---
+
+# Step 5c — Event Volume Collapse by Tract
+
+Even where venues survived, total event volume could collapse — a subtler form
+of cultural erosion. We spatially assign each event to a census tract and
+compare total event counts between the 1980s and 2000s per tract.
+
+```{r event-volume}
+events_tract <- st_join(
+  events_sf %>% filter(decade %in% c(1980, 2000)),
+  tracts_full %>% select(GEOID),
+  join = st_within
+) %>%
+  st_drop_geometry() %>%
+  filter(!is.na(GEOID))
+
+event_volume <- events_tract %>%
+  group_by(GEOID, decade) %>%
+  summarise(n_events = n(), .groups = "drop") %>%
+  pivot_wider(names_from = decade, values_from = n_events,
+              names_prefix = "events_", values_fill = 0) %>%
+  rename(events_1980s = events_1980, events_2000s = events_2000) %>%
+  mutate(
+    event_change_abs = events_2000s - events_1980s,
+    event_change_pct = ifelse(
+      events_1980s > 0,
+      round((events_2000s - events_1980s) / events_1980s * 100, 1),
+      NA_real_
+    )
+  )
+
+tracts_full <- tracts_full %>%
+  left_join(event_volume, by = "GEOID") %>%
+  mutate(
+    events_1980s     = replace_na(events_1980s, 0),
+    events_2000s     = replace_na(events_2000s, 0),
+    event_change_abs = replace_na(event_change_abs, 0)
+  )
+
+cat("Tracts with event volume data:", sum(!is.na(tracts_full$event_change_pct)), "\n")
+cat("Tracts where event volume fell:", sum(tracts_full$event_change_abs < 0, na.rm=TRUE), "\n")
+```
+
+---
+
+# Step 5d — Genre Displacement by Tract
+
+We compute the dominant genre per tract for the 1980s and 2000s separately,
+then flag tracts where the top genre shifted — a proxy for cultural displacement
+alongside demographic change.
+
+```{r genre-displacement}
+dominant_genre_by_decade <- events_tract %>%
+  filter(macro_genre != "Unknown/Other") %>%
+  group_by(GEOID, decade, macro_genre) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(GEOID, decade) %>%
+  slice_max(n, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(GEOID, decade, dominant_genre = macro_genre) %>%
+  pivot_wider(names_from = decade, values_from = dominant_genre,
+              names_prefix = "genre_")
+
+# Rename columns if they exist
+if ("genre_1980" %in% names(dominant_genre_by_decade)) {
+  dominant_genre_by_decade <- dominant_genre_by_decade %>%
+    rename(genre_1980s = genre_1980, genre_2000s = genre_2000)
+}
+
+dominant_genre_by_decade <- dominant_genre_by_decade %>%
+  mutate(genre_shifted = !is.na(genre_1980s) & !is.na(genre_2000s) &
+                          genre_1980s != genre_2000s)
+
+tracts_full <- tracts_full %>%
+  left_join(dominant_genre_by_decade, by = "GEOID")
+
+cat("Tracts with genre data in both decades:",
+    sum(!is.na(tracts_full$genre_1980s) & !is.na(tracts_full$genre_2000s)), "\n")
+cat("Tracts where dominant genre shifted:",
+    sum(tracts_full$genre_shifted, na.rm = TRUE), "\n")
+```
+
+---
+
+# Step 6 — Build the Layered Leaflet Map
+
+The map has 11 choropleth overlays and 7 venue point layers, all independently
+toggleable. Use the layer control (top-right, collapsed by default) to explore.
+
+```{r color-palettes}
+# ── Rent ──────────────────────────────────────────────────────────────────────
+pal_rent_1980   <- colorBin("Blues", domain = tracts_full$rent_1980,
+                              bins = 6, na.color = "#cccccc")
+pal_rent_2000   <- colorBin("Blues", domain = tracts_full$rent_2000,
+                              bins = 6, na.color = "#cccccc")
+pal_rent_change <- colorBin(
+  palette  = c("#2166ac","#92c5de","#f7f7f7","#f4a582","#d6604d","#b2182b"),
+  domain   = tracts_full$rent_change_80_00,
+  bins     = 7, na.color = "#cccccc"
+)
+
+# ── Race / ethnicity ──────────────────────────────────────────────────────────
+pal_hispanic <- colorBin("Greens",  domain = tracts_full$pct_hispanic,
+                          bins = 6, na.color = "#cccccc")
+pal_black    <- colorBin("Purples", domain = tracts_full$pct_black,
+                          bins = 6, na.color = "#cccccc")
+
+# ── Housing tenure ────────────────────────────────────────────────────────────
+pal_renter <- colorBin("Oranges", domain = tracts_full$pct_renter,
+                        bins = 6, na.color = "#cccccc")
+
+# ── Displacement Risk Index (yellow → red) ────────────────────────────────────
+pal_risk <- colorBin("YlOrRd", domain = tracts_full$displacement_risk_idx,
+                      bins = 6, na.color = "#cccccc")
+
+# ── Venue churn (net) — red = net loss, green = net gain ─────────────────────
+churn_range <- range(tracts_full$net_venue_change, na.rm = TRUE)
+pal_venue_churn <- colorBin(
+  palette  = c("#b2182b","#ef8a62","#fddbc7","#f7f7f7","#a1d99b","#41ab5d","#006d2c"),
+  domain   = tracts_full$net_venue_change,
+  bins     = 7, na.color = "#eeeeee"
+)
+
+# ── Event volume change (diverging) ──────────────────────────────────────────
+pal_event_change <- colorBin(
+  palette  = c("#b2182b","#ef8a62","#fddbc7","#f7f7f7","#d1e5f0","#67a9cf","#2166ac"),
+  domain   = tracts_full$event_change_pct,
+  bins     = 7, na.color = "#cccccc"
+)
+
+# ── Genre categories ──────────────────────────────────────────────────────────
+genre_levels <- c("Country","Tejano/Latin","Classical","Rock","Jazz",
+                   "Blues/R&B","Metal","Pop","Electronic","Other","Unknown/Other")
+pal_genre <- colorFactor(
+  palette  = c(brewer.pal(8, "Dark2"), "#aaaaaa", "#888888", "#555555"),
+  domain   = genre_levels,
+  na.color = "#555555"
+)
+
+# Dominant genre palette (same colors, applied to tract polygons)
+genre_palette_vec <- setNames(
+  c(brewer.pal(8, "Dark2"), "#aaaaaa", "#888888", "#555555"),
+  genre_levels
+)
+pal_dom_genre <- colorFactor(
+  palette = genre_palette_vec,
+  domain  = genre_levels,
+  na.color = "#eeeeee"
+)
+```
+
+```{r build-map}
+title_html <- tags$div(
+  style = paste(
+    "position:fixed; top:10px; left:50%; transform:translateX(-50%);",
+    "background:rgba(255,255,255,0.93); padding:8px 18px; border-radius:6px;",
+    "box-shadow:0 2px 8px rgba(0,0,0,.25); z-index:900;",
+    "font-family:sans-serif; font-size:14px; font-weight:700;",
+    "color:#222; text-align:center; max-width:90vw;"
+  ),
+  "Sounds of San Anto: Music Venues & Neighborhood Change in San Antonio, 1970–2010"
+)
+
+note_html <- tags$div(
+  style = paste(
+    "position:fixed; bottom:28px; left:10px;",
+    "background:rgba(255,255,255,0.88); padding:5px 10px; border-radius:4px;",
+    "box-shadow:0 1px 4px rgba(0,0,0,.2); z-index:900;",
+    "font-family:sans-serif; font-size:10px; color:#555; max-width:320px;"
+  ),
+  HTML(paste0(
+    nrow(venues_sf), " geocoded venues (~32% of known venues). ",
+    "Northern concentration may reflect geocoding bias. ",
+    "Sources: NHGIS, U.S. Census 1980–2000, CEDISH/UTSA."
+  ))
+)
+
+leaflet_map <- leaflet(options = leafletOptions(zoomControl = TRUE)) %>%
+
+  # ── Tile base layers ────────────────────────────────────────────────────────
+  addProviderTiles("OpenStreetMap",      group = "OpenStreetMap") %>%
+  addProviderTiles("CartoDB.DarkMatter", group = "Dark Map") %>%
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # ECONOMIC LAYERS
+  # ════════════════════════════════════════════════════════════════════════════
+
+  addPolygons(
+    data = tracts_full, group = "Median Rent 1980",
+    fillColor = ~pal_rent_1980(rent_1980), fillOpacity = 0.7,
+    color = "white", weight = 0.5, smoothFactor = 1,
+    label = ~paste0("Tract ", TRACT, " · $", rent_1980, " (1980)"),
+    labelOptions = labelOptions(style = list("font-size" = "12px"))
+  ) %>%
+  addLegend("bottomright", pal = pal_rent_1980, values = tracts_full$rent_1980,
+            title = "Median Rent<br>1980 ($)", opacity = 0.85,
+            group = "Median Rent 1980", layerId = "leg_r80") %>%
+
+  addPolygons(
+    data = tracts_full, group = "Median Rent 2000",
+    fillColor = ~pal_rent_2000(rent_2000), fillOpacity = 0.7,
+    color = "white", weight = 0.5, smoothFactor = 1,
+    label = ~paste0("Tract ", TRACT, " · $", rent_2000, " (2000)"),
+    labelOptions = labelOptions(style = list("font-size" = "12px"))
+  ) %>%
+  addLegend("bottomright", pal = pal_rent_2000, values = tracts_full$rent_2000,
+            title = "Median Rent<br>2000 ($)", opacity = 0.85,
+            group = "Median Rent 2000", layerId = "leg_r00") %>%
+
+  addPolygons(
+    data = tracts_full, group = "Rent Change 1980→2000",
+    fillColor = ~pal_rent_change(rent_change_80_00), fillOpacity = 0.75,
+    color = "white", weight = 0.5, smoothFactor = 1,
+    label = ~paste0("Tract ", TRACT, " · Δ$",
+                    ifelse(is.na(rent_change_80_00), "N/A",
+                           format(round(rent_change_80_00), big.mark=","))),
+    labelOptions = labelOptions(style = list("font-size" = "12px"))
+  ) %>%
+  addLegend("bottomright", pal = pal_rent_change,
+            values = tracts_full$rent_change_80_00,
+            title = "Rent Change<br>1980→2000 ($)<br><small>Red = rising pressure</small>",
+            opacity = 0.85, group = "Rent Change 1980→2000",
+            layerId = "leg_rchg") %>%
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # RACE / ETHNICITY LAYERS
+  # ════════════════════════════════════════════════════════════════════════════
+
+  addPolygons(
+    data = tracts_full, group = "% Hispanic (2000)",
+    fillColor = ~pal_hispanic(pct_hispanic), fillOpacity = 0.7,
+    color = "white", weight = 0.5, smoothFactor = 1,
+    label = ~paste0("Tract ", TRACT, " · ",
+                    ifelse(is.na(pct_hispanic), "N/A",
+                           paste0(pct_hispanic, "% Hispanic"))),
+    labelOptions = labelOptions(style = list("font-size" = "12px"))
+  ) %>%
+  addLegend("bottomright", pal = pal_hispanic, values = tracts_full$pct_hispanic,
+            title = "% Hispanic<br>(2000)", opacity = 0.85,
+            group = "% Hispanic (2000)", layerId = "leg_hisp") %>%
+
+  addPolygons(
+    data = tracts_full, group = "% Black Population (2000)",
+    fillColor = ~pal_black(pct_black), fillOpacity = 0.7,
+    color = "white", weight = 0.5, smoothFactor = 1,
+    label = ~paste0("Tract ", TRACT, " · ",
+                    ifelse(is.na(pct_black), "N/A",
+                           paste0(pct_black, "% Black"))),
+    labelOptions = labelOptions(style = list("font-size" = "12px"))
+  ) %>%
+  addLegend("bottomright", pal = pal_black, values = tracts_full$pct_black,
+            title = "% Black Pop<br>(2000)", opacity = 0.85,
+            group = "% Black Population (2000)", layerId = "leg_blk") %>%
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # DISPLACEMENT VULNERABILITY LAYERS
+  # ════════════════════════════════════════════════════════════════════════════
+
+  addPolygons(
+    data = tracts_full, group = "% Renter-Occupied (2000)",
+    fillColor = ~pal_renter(pct_renter), fillOpacity = 0.7,
+    color = "white", weight = 0.5, smoothFactor = 1,
+    label = ~paste0("Tract ", TRACT, " · ",
+                    ifelse(is.na(pct_renter), "N/A",
+                           paste0(pct_renter, "% renter-occupied"))),
+    labelOptions = labelOptions(style = list("font-size" = "12px"))
+  ) %>%
+  addLegend("bottomright", pal = pal_renter, values = tracts_full$pct_renter,
+            title = "% Renter-Occ<br>(2000)<br><small>High = more vulnerable</small>",
+            opacity = 0.85, group = "% Renter-Occupied (2000)",
+            layerId = "leg_rent") %>%
+
+  addPolygons(
+    data = tracts_full, group = "Displacement Risk Index",
+    fillColor = ~pal_risk(displacement_risk_idx), fillOpacity = 0.72,
+    color = "white", weight = 0.5, smoothFactor = 1,
+    label = ~paste0("Tract ", TRACT, " · Risk index: ",
+                    ifelse(is.na(displacement_risk_idx), "N/A",
+                           displacement_risk_idx)),
+    labelOptions = labelOptions(style = list("font-size" = "12px"))
+  ) %>%
+  addLegend("bottomright", pal = pal_risk,
+            values = tracts_full$displacement_risk_idx,
+            title = "Displacement Risk<br>Index (0–100)<br><small>Rent change × renter %</small>",
+            opacity = 0.85, group = "Displacement Risk Index",
+            layerId = "leg_risk") %>%
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # CULTURAL IMPACT LAYERS
+  # ════════════════════════════════════════════════════════════════════════════
+
+  addPolygons(
+    data = tracts_full, group = "Venue Churn 1980s→2000s",
+    fillColor = ~pal_venue_churn(net_venue_change), fillOpacity = 0.75,
+    color = "white", weight = 0.5, smoothFactor = 1,
+    label = ~paste0("Tract ", TRACT,
+                    " · Lost: ", venues_lost,
+                    " · Gained: ", venues_gained,
+                    " · Net: ", net_venue_change),
+    labelOptions = labelOptions(style = list("font-size" = "12px"))
+  ) %>%
+  addLegend("bottomright", pal = pal_venue_churn,
+            values = tracts_full$net_venue_change,
+            title = "Net Venue Change<br>1980s→2000s<br><small>Red = net loss</small>",
+            opacity = 0.85, group = "Venue Churn 1980s→2000s",
+            layerId = "leg_churn") %>%
+
+  addPolygons(
+    data = tracts_full, group = "Event Volume Change 1980s→2000s",
+    fillColor = ~pal_event_change(event_change_pct), fillOpacity = 0.72,
+    color = "white", weight = 0.5, smoothFactor = 1,
+    label = ~paste0("Tract ", TRACT,
+                    " · 1980s: ", events_1980s,
+                    " events · 2000s: ", events_2000s,
+                    " · Change: ",
+                    ifelse(is.na(event_change_pct), "N/A",
+                           paste0(event_change_pct, "%"))),
+    labelOptions = labelOptions(style = list("font-size" = "12px"))
+  ) %>%
+  addLegend("bottomright", pal = pal_event_change,
+            values = tracts_full$event_change_pct,
+            title = "Event Volume<br>Change (%)<br>1980s→2000s<br><small>Red = collapse</small>",
+            opacity = 0.85, group = "Event Volume Change 1980s→2000s",
+            layerId = "leg_evol") %>%
+
+  # ── Dominant Genre 1980s (categorical choropleth) ────────────────────────────
+  addPolygons(
+    data = tracts_full, group = "Dominant Genre 1980s",
+    fillColor = ~pal_dom_genre(genre_1980s), fillOpacity = 0.72,
+    color = "white", weight = 0.5, smoothFactor = 1,
+    label = ~paste0("Tract ", TRACT, " · ",
+                    ifelse(is.na(genre_1980s), "No data", genre_1980s),
+                    " (dominant 1980s)"),
+    labelOptions = labelOptions(style = list("font-size" = "12px"))
+  ) %>%
+  addLegend("bottomright", pal = pal_dom_genre,
+            values = tracts_full$genre_1980s,
+            title = "Dominant Genre<br>1980s (by tract)",
+            opacity = 0.85, group = "Dominant Genre 1980s",
+            layerId = "leg_g80") %>%
+
+  addPolygons(
+    data = tracts_full, group = "Dominant Genre 2000s",
+    fillColor = ~pal_dom_genre(genre_2000s), fillOpacity = 0.72,
+    color = "white", weight = 0.5, smoothFactor = 1,
+    label = ~paste0("Tract ", TRACT, " · ",
+                    ifelse(is.na(genre_2000s), "No data", genre_2000s),
+                    " (dominant 2000s)",
+                    ifelse(isTRUE(genre_shifted), " ⚠ SHIFTED", "")),
+    labelOptions = labelOptions(style = list("font-size" = "12px"))
+  ) %>%
+  addLegend("bottomright", pal = pal_dom_genre,
+            values = tracts_full$genre_2000s,
+            title = "Dominant Genre<br>2000s (by tract)",
+            opacity = 0.85, group = "Dominant Genre 2000s",
+            layerId = "leg_g00") %>%
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # VENUE POINT LAYERS
+  # ════════════════════════════════════════════════════════════════════════════
+
+  addCircleMarkers(
+    data = venues_sf, group = "All Venues",
+    radius = 6, color = "white", weight = 1,
+    fillColor = ~pal_genre(str_extract(top_genres, "^[^,]+")),
+    fillOpacity = 0.85, popup = ~popup_html,
+    clusterOptions = markerClusterOptions(showCoverageOnHover = FALSE,
+                                          maxClusterRadius = 40)
+  ) %>%
+  addLegend("topright", pal = pal_genre, values = genre_levels,
+            title = "Music Genre<br>(All Venues)", opacity = 0.85,
+            group = "All Venues") %>%
+
+  addCircleMarkers(data = venues_1970s, group = "Venues 1970s",
+    radius = 5, color = "white", weight = 1,
+    fillColor = "#e6ab02", fillOpacity = 0.85, popup = ~popup_html) %>%
+
+  addCircleMarkers(data = venues_1980s, group = "Venues 1980s",
+    radius = 5, color = "white", weight = 1,
+    fillColor = "#1b9e77", fillOpacity = 0.85, popup = ~popup_html) %>%
+
+  addCircleMarkers(data = venues_1990s, group = "Venues 1990s",
+    radius = 5, color = "white", weight = 1,
+    fillColor = "#d95f02", fillOpacity = 0.85, popup = ~popup_html) %>%
+
+  addCircleMarkers(data = venues_2000s, group = "Venues 2000s",
+    radius = 5, color = "white", weight = 1,
+    fillColor = "#7570b3", fillOpacity = 0.85, popup = ~popup_html) %>%
+
+  # ── Venue churn point markers ────────────────────────────────────────────────
+  addCircleMarkers(
+    data = venues_lost_sf, group = "Venues Lost (1980s→2000s)",
+    radius = 7, color = "#7b0000", weight = 2,
+    fillColor = "#e31a1c", fillOpacity = 0.9,
+    popup = ~popup_html
+  ) %>%
+
+  addCircleMarkers(
+    data = venues_gained_sf, group = "Venues Gained (new in 2000s)",
+    radius = 7, color = "#005a00", weight = 2,
+    fillColor = "#33a02c", fillOpacity = 0.9,
+    popup = ~popup_html
+  ) %>%
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # LAYER CONTROL
+  # ════════════════════════════════════════════════════════════════════════════
+
+  addLayersControl(
+    baseGroups    = c("OpenStreetMap", "Dark Map"),
+    overlayGroups = c(
+      # Economic
+      "Median Rent 1980",
+      "Median Rent 2000",
+      "Rent Change 1980→2000",
+      # Race
+      "% Hispanic (2000)",
+      "% Black Population (2000)",
+      # Displacement vulnerability
+      "% Renter-Occupied (2000)",
+      "Displacement Risk Index",
+      # Cultural impact
+      "Venue Churn 1980s→2000s",
+      "Event Volume Change 1980s→2000s",
+      "Dominant Genre 1980s",
+      "Dominant Genre 2000s",
+      # Venue points
+      "All Venues",
+      "Venues 1970s",
+      "Venues 1980s",
+      "Venues 1990s",
+      "Venues 2000s",
+      "Venues Lost (1980s→2000s)",
+      "Venues Gained (new in 2000s)"
+    ),
+    options = layersControlOptions(collapsed = TRUE)
+  ) %>%
+
+  # Default visible: Rent Change + All Venues + Venues Lost
+  hideGroup(c(
+    "Median Rent 1980",
+    "Median Rent 2000",
+    "% Hispanic (2000)",
+    "% Black Population (2000)",
+    "% Renter-Occupied (2000)",
+    "Displacement Risk Index",
+    "Venue Churn 1980s→2000s",
+    "Event Volume Change 1980s→2000s",
+    "Dominant Genre 1980s",
+    "Dominant Genre 2000s",
+    "Venues 1970s",
+    "Venues 1980s",
+    "Venues 1990s",
+    "Venues 2000s",
+    "Venues Gained (new in 2000s)"
+  )) %>%
+
+  # ── Map controls ─────────────────────────────────────────────────────────────
+  setView(lng = -98.4936, lat = 29.4241, zoom = 11) %>%
+  addMiniMap(toggleDisplay = TRUE, minimized = TRUE) %>%
+  addScaleBar(position = "bottomleft") %>%
+  addControl(title_html, position = "topleft") %>%
+  addControl(note_html,  position = "bottomleft")
+
+leaflet_map
+```
+
+---
+
+# Step 7 — Console Summary
+
+```{r summary}
+cat("=== Sounds of San Anto — Map Summary ===\n\n")
+
+cat("── Events ──────────────────────────────\n")
+cat("Total in dataset:   ", nrow(events_raw), "\n")
+cat("Geocoded (usable):  ", nrow(events),     "\n")
+cat("Missing genre data: ", sum(events$macro_genre == "Unknown/Other"), "\n\n")
+
+cat("── Venues ──────────────────────────────\n")
+cat("Plotted (All Venues):    ", nrow(venues_sf), "\n")
+cat("Zero matched events:     ", sum(venues_sf$n_events == 0), "\n")
+cat("Lost (1980s → 2000s):    ", nrow(venues_lost_sf), "\n")
+cat("Gained (new in 2000s):   ", nrow(venues_gained_sf), "\n\n")
+
+cat("── Tracts (278 total) ──────────────────\n")
+cat("With rent_1980:        ", sum(!is.na(tracts_full$rent_1980)), "\n")
+cat("With rent_2000:        ", sum(!is.na(tracts_full$rent_2000)), "\n")
+cat("With income_2000:      ", sum(!is.na(tracts_full$income_2000)), "\n")
+cat("With Hispanic %:       ", sum(!is.na(tracts_full$pct_hispanic)), "\n")
+cat("With Black %:          ", sum(!is.na(tracts_full$pct_black)), "\n")
+cat("With renter %:         ", sum(!is.na(tracts_full$pct_renter)),            "\n")
+cat("With risk index:       ", sum(!is.na(tracts_full$displacement_risk_idx)), "\n")
+cat("Lost ≥1 venue:         ", sum(tracts_full$venues_lost > 0), "\n")
+cat("Event volume decline:  ",
+    sum(tracts_full$event_change_abs < 0, na.rm = TRUE), "\n")
+cat("Genre shifted:         ",
+    sum(tracts_full$genre_shifted, na.rm = TRUE), "\n\n")
+
+cat("── Macro-genre breakdown (events) ──────\n")
+print(sort(table(events$macro_genre), decreasing = TRUE))
+```
+
+---
+
+# Step 8 — Save Map
+
+```{r save-map}
+saveWidget(
+  leaflet_map,
+  file          = "sounds_san_anto_map.html",
+  selfcontained = TRUE,
+  title         = "Sounds of San Anto: Music Venues & Neighborhood Change"
+)
+cat("Saved: sounds_san_anto_map.html\n")
+```
+
+---
+
+# Findings & Interpretation
+
+**Venue geography and rent pressure**: Venues on the north side of San Antonio
+largely occupy tracts with the steepest rent increases 1980–2000 — both because
+those corridors were commercially active and because the dataset has a documented
+northside collector bias.
+
+**Hispanic and Black geography**: The % Hispanic and % Black layers reveal
+distinct spatial patterns. Hispanic population concentrates on the south and
+west sides; Black population concentrates on the eastside. Overlaying these with
+the Rent Change layer shows that many majority-minority tracts experienced
+significant rent pressure with minimal venue investment — consistent with
+cultural underinvestment in gentrifying minority neighborhoods.
+
+**Renter vulnerability**: Tracts with high renter-occupied rates (orange layer)
+and high rent increases are the most displacement-vulnerable. The southside and
+eastside show this combination clearly — the residents with the least ability to
+absorb rising housing costs.
+
+**Displacement Risk Index**: The composite layer (rent change × renter %)
+synthesizes economic pressure and residential vulnerability into a single score.
+High-scoring tracts (deep red/orange) are the neighborhoods where gentrification
+most directly threatened the resident population — and where the venue loss and
+event volume collapse layers should show the greatest cultural erosion.
+
+**Venue churn and event volume collapse**: The "Venues Lost" red markers and
+the Venue Churn choropleth together show where the music economy contracted
+most sharply. Tracts with high rent increases tend to show either venue
+displacement (venues pushed to cheaper areas) or venue gentrification (new
+venues catering to incoming higher-income residents).
+
+**Genre displacement**: The Dominant Genre 1980s vs. 2000s layers make
+cultural displacement legible spatially — tracts where Tejano/Latin was
+dominant in the 1980s but shifted to Rock or Country by the 2000s map onto
+the same corridors experiencing demographic change and rent pressure.
+
+**Limitations**: 312 of ~974 known venues (~32%) are geocoded. Tract boundary
+changes between 1980–2000 limit perfect cross-year comparisons. Rent and
+income figures are nominal (not inflation-adjusted). Genre displacement
+analysis is limited to the ~38% of events that have genre data.
